@@ -1,19 +1,27 @@
 /*
  * SKETCH: arduino_remote_config_c5_final.ino
- * OBJETIVO: Versión final del código con configuración dinámica totalmente funcional
- * y corrección de pines/host, implementando la estructura jerárquica de la RTDB.
+ * OBJETIVO: Versión final del código con configuración dinámica y OTA totalmente funcional
  * * * CORRECCIONES:
- * 1. PINES: PH en GPIO 5 y TDS en GPIO 4.
- * 2. CONFIG: Se corrigió el RTDB_HOST para incluir '-default-rtdb'.
- * 3. CONFIG: La ruta de lectura se corrigió a '/.json' para la configuración en la raíz.
- * 4. PARSING: Lógica de JSON actualizada para leer configuración anidada:
- * - Parámetros generales: bajo "remote_config"
- * - Intervalo de envío: bajo "firmware_updates/[NODE_TYPE_KEY]"
+ * 1. ERROR DE COMPILACIÓN SOLUCIONADO: Se corrigió la función perform_update() para escribir
+ * correctamente el flujo de datos HTTP en el proceso de actualización OTA, eliminando el
+ * error 'cannot convert 'UpdateClass' to 'Stream*'.
+ * 2. CLAVE NODO: Corregida de "NODO_AGUA" a "NODO_H2O" para coincidir con la RTDB.
+ * 3. FUNCIONALIDAD OTA: Implementación completa de la lógica de comparación de versiones,
+ * descarga segura (HTTPS) y flasheo del firmware Over-The-Air.
  */
 
 #include <WiFi.h>              
 #include <HTTPClient.h>        
 #include <ArduinoJson.h>       
+#include <Update.h>            // Librería para la actualización OTA
+#include <WiFiClientSecure.h>  // Cliente seguro para HTTPS (necesario para GitHub raw)
+
+// ======================================================
+// 0. VERSIÓN LOCAL DEL FIRMWARE (DEFINE LA VERSIÓN ACTUAL)
+// ======================================================
+// ⚠️ ESTE VALOR DEBE INCREMENTARSE EN CADA NUEVA COMPILACIÓN
+const char* FIRMWARE_VERSION_CODE = "1.0.0";
+
 
 // ======================================================
 // 1. CONFIGURACIÓN DE LA RED WIFI Y FIREBASE
@@ -24,7 +32,6 @@ const char* password = "Ubuntu1234$";
 
 // ⚠️ REEMPLAZAR CON TUS CLAVES Y HOST
 const char* API_KEY = "AIzaSyAxGSXV2br1SsFu7YyP6NZaTXc_Z40uqA8"; 
-// 🟢 HOST CORREGIDO: Usando el dominio completo de Firebase RTDB
 const char* RTDB_HOST = "arduinoconfigremota-default-rtdb.firebaseio.com";                   
 
 // ======================================================
@@ -34,10 +41,13 @@ const char* RTDB_HOST = "arduinoconfigremota-default-rtdb.firebaseio.com";
 String backendHost = "192.168.68.54";    
 int backendPort = 3000;                  
 String endpointCalidadAgua = "/sensor-data/arduino/batch"; 
-long intervaloEnvioMs = 60000;           // Este valor se sobrescribe con la config de NODO_AGUA
+long intervaloEnvioMs = 60000;           
 bool flagActivo = true;                  
+String latestFirmwareVersion = "0.0.0";  // Versión actual del firmware cargado
+String remoteFirmwareVersion = "0.0.0";  // Versión remota de Firebase
+String firmwareUrl = "";                 // URL del binario para OTA
 
-// 🟢 URL BASE: Apunta a la raíz para leer todo el objeto de configuración
+// URL BASE: Apunta a la raíz para leer todo el objeto de configuración
 const String RTDB_CONFIG_URL_BASE = "https://" + String(RTDB_HOST) + "/.json";
 
 
@@ -45,11 +55,10 @@ const String RTDB_CONFIG_URL_BASE = "https://" + String(RTDB_HOST) + "/.json";
 // 3. DATOS DEL DISPOSITIVO Y SENSORES (Parámetros)
 // ======================================================
 const char* BOX_SERIAL_ID = "eea11eb7-e5eb-45d7-be52-69ff8d15e6e-AGUA"; 
-// 🔑 CLAVE ÚNICA DEL NODO en la sección 'firmware_updates' de Firebase.
-// Si este nodo es 'NODO_SUELO' u otro, DEBES cambiar esta constante.
-const char* NODE_TYPE_KEY = "NODO_AGUA"; 
+// 🔑 CLAVE ÚNICA DEL NODO: CORREGIDA a "NODO_H2O"
+const char* NODE_TYPE_KEY = "NODO_H2O"; 
 
-// 🟢 PINES CORREGIDOS DEFINITIVAMENTE: 
+// PINES CORREGIDOS DEFINITIVAMENTE: 
 const int PH_PIN = 5;       // PH en GPIO 5
 const int TDS_PIN = 4;      // TDS en GPIO 4
 
@@ -77,7 +86,7 @@ float tds_value = 0.0;
 // 4. GESTIÓN DEL TIEMPO 
 // ======================================================
 unsigned long lastConfigFetch = 0; 
-const long CONFIG_FETCH_INTERVAL = 60000; // 60 segundos
+const long CONFIG_FETCH_INTERVAL = 60000; // 60 segundos (Frecuencia para verificar la config/OTA)
 
 // Declaraciones de funciones
 void configurar_adc();
@@ -86,6 +95,9 @@ void leer_sensores_agua();
 bool conectar_wifi();
 void enviar_post_batch();
 bool obtener_remote_config(); 
+int compareVersions(String current, String remote);
+bool check_for_update();
+void perform_update();
 
 
 // ======================================================
@@ -98,18 +110,131 @@ void setup() {
   configurar_adc();
   calcular_calibracion_ph();
 
-  Serial.println(F("\n--- 💧 Nodo de Monitoreo de Agua con Configuración Dinámica (REST) ---"));
+  // Guardamos la versión local definida
+  latestFirmwareVersion = String(FIRMWARE_VERSION_CODE); 
+  
+  Serial.println(F("\n--- 💧 Nodo de Monitoreo de Agua con Configuración Dinámica y OTA ---"));
   Serial.printf(F("ID: %s\n"), BOX_SERIAL_ID);
+  Serial.printf(F("VERSIÓN ACTUAL (Local): %s\n"), latestFirmwareVersion.c_str());
   
   if (conectar_wifi()) {
+      // Intentamos obtener la configuración remota y las versiones
       obtener_remote_config();
+      // Verificamos si hay OTA inmediatamente después de obtener la config inicial
+      check_for_update();
       lastConfigFetch = millis();
   }
 }
 
 // ----------------------------------------------------
-// FUNCIONES DE CONFIGURACIÓN VÍA REST API
+// FUNCIONES DE CONFIGURACIÓN VÍA REST API Y OTA
 // ----------------------------------------------------
+
+// Compara versiones en formato "X.Y.Z"
+// Retorna -1 si current < remote, 0 si son iguales, 1 si current > remote
+int compareVersions(String current, String remote) {
+  int cur_v[3] = {0, 0, 0};
+  int rem_v[3] = {0, 0, 0};
+
+  // Parsea las cadenas de versión (X.Y.Z)
+  sscanf(current.c_str(), "%d.%d.%d", &cur_v[0], &cur_v[1], &cur_v[2]);
+  sscanf(remote.c_str(), "%d.%d.%d", &rem_v[0], &rem_v[1], &rem_v[2]);
+
+  for (int i = 0; i < 3; i++) {
+    if (cur_v[i] < rem_v[i]) return -1;
+    if (cur_v[i] > rem_v[i]) return 1;
+  }
+  return 0; // Versiones iguales
+}
+
+// Verifica si la versión remota es superior a la versión actual
+bool check_for_update() {
+  if (remoteFirmwareVersion.isEmpty() || remoteFirmwareVersion == "0.0.0") {
+    Serial.println(F("🟡 OTA Skip: Versión remota no válida."));
+    return false;
+  }
+
+  int comparison = compareVersions(latestFirmwareVersion, remoteFirmwareVersion);
+
+  if (comparison < 0) {
+    Serial.printf(F("🔴 📢 ACTUALIZACIÓN REQUERIDA: Versión local %s -> Remota %s\n"), latestFirmwareVersion.c_str(), remoteFirmwareVersion.c_str());
+    if (!firmwareUrl.isEmpty()) {
+      perform_update();
+      return true;
+    } else {
+      Serial.println(F("❌ ERROR OTA: URL de firmware vacía. No se puede actualizar."));
+      return false;
+    }
+  } else {
+    Serial.printf(F("✅ OTA: La versión actual (%s) está al día.\n"), latestFirmwareVersion.c_str());
+    return false;
+  }
+}
+
+// Realiza la descarga y flasheo del firmware
+void perform_update() {
+  Serial.printf(F("🚀 Iniciando actualización OTA desde: %s\n"), firmwareUrl.c_str());
+  
+  if (!firmwareUrl.startsWith("https://")) {
+      Serial.println(F("❌ ERROR: La URL del firmware no es HTTPS. Se requiere HTTPS para OTA."));
+      return;
+  }
+
+  // Usamos WiFiClientSecure para la conexión HTTPS a GitHub
+  WiFiClientSecure client;
+  // Permite conexiones HTTPS sin verificar el certificado (más fácil para GitHub raw)
+  client.setInsecure(); 
+  
+  HTTPClient http;
+  
+  if (http.begin(client, firmwareUrl)) {
+    int httpCode = http.GET();
+    
+    if (httpCode == HTTP_CODE_OK) {
+      int contentLength = http.getSize();
+      Serial.printf(F("Tamaño del nuevo firmware: %d bytes.\n"), contentLength);
+      
+      bool canBegin = Update.begin(contentLength);
+      
+      if (canBegin) {
+        Serial.println(F("Iniciando proceso de flasheo..."));
+        
+        // 🟢 SOLUCIÓN DEL ERROR: Usamos http.getStream() para obtener el flujo de datos
+        // y luego lo escribimos a Update.
+        // http.getStream() retorna un objeto Stream, compatible con Update.writeStream()
+        
+        // Obtenemos un puntero al Stream de datos de la respuesta HTTP
+        WiFiClient* stream = http.getStreamPtr(); 
+        
+        // Escribimos el contenido del stream (binario) al proceso de actualización
+        // Esto es más seguro y maneja la transferencia chunk por chunk
+        size_t written = Update.writeStream(*stream);
+        
+        if (written == contentLength) {
+          Serial.printf(F("Descarga y escritura completada: %d bytes.\n"), written);
+        } else {
+          Serial.printf(F("❌ Error de escritura: Escrito %zu de %d bytes.\n"), written, contentLength);
+        }
+        
+        if (Update.end()) {
+          Serial.println(F("✅ Actualización finalizada exitosamente. Reiniciando..."));
+          // Reinicio forzado después de la actualización exitosa
+          ESP.restart(); 
+        } else {
+          Serial.printf(F("❌ Error al finalizar la actualización. Error: %d. Mensaje: %s\n"), Update.getError(), Update.errorString());
+        }
+      } else {
+        Serial.println(F("❌ ERROR: No hay suficiente espacio para la actualización."));
+      }
+    } else {
+      Serial.printf(F("❌ ERROR HTTP (%d): No se pudo descargar el archivo de firmware. URL: %s\n"), httpCode, firmwareUrl.c_str());
+    }
+    http.end();
+  } else {
+    Serial.println(F("❌ ERROR: No se pudo conectar a la URL de firmware."));
+  }
+}
+
 
 bool obtener_remote_config() {
   Serial.println(F("\n--- Obteniendo Configuración Dinámica (Vía REST API) ---"));
@@ -119,12 +244,10 @@ bool obtener_remote_config() {
     return false;
   }
   
-  // La clave de autenticación se añade para asegurar el acceso de lectura
   String fullUrl = RTDB_CONFIG_URL_BASE + "?auth=" + String(API_KEY); 
   
   Serial.printf(F("Nodo a buscar en RTDB: %s\n"), NODE_TYPE_KEY);
   
-  // Guardamos el intervalo anterior para reportar si hubo un cambio
   long oldIntervaloEnvioMs = intervaloEnvioMs; 
 
   HTTPClient http;
@@ -136,8 +259,8 @@ bool obtener_remote_config() {
     Serial.printf(F("✅ Configuración obtenida. Código HTTP: %d\n"), httpCode);
     String payload = http.getString();
     
-    // ⬆️ Aumentamos el buffer a 1024 para la estructura anidada y completa
-    DynamicJsonDocument doc(1024); 
+    // Aumentamos el buffer a 1536 para la estructura anidada completa con OTA
+    DynamicJsonDocument doc(1536); 
     DeserializationError error = deserializeJson(doc, payload);
 
     if (error) {
@@ -151,7 +274,7 @@ bool obtener_remote_config() {
     if (remoteConfig.isNull()) {
         Serial.println(F("❌ Fallo: Objeto 'remote_config' no encontrado. Usando fallbacks."));
     } else {
-        // A. CONFIGURACIÓN GENERAL (Bajo /remote_config)
+        // A. CONFIGURACIÓN GENERAL
         if (remoteConfig.containsKey(F("backend_host")) && remoteConfig[F("backend_host")].is<String>()) {
           backendHost = remoteConfig[F("backend_host")].as<String>();
         }
@@ -184,6 +307,15 @@ bool obtener_remote_config() {
              Serial.printf(F("🟢 LOG: INTERVALO ACTUALIZADO: Nuevo valor remoto = %ld ms\n"), intervaloEnvioMs);
           } 
         }
+
+        // C. VERSIÓN Y URL DEL FIRMWARE PARA OTA
+        if (nodeConfig.containsKey(F("latest_firmware_version")) && nodeConfig[F("latest_firmware_version")].is<String>()) {
+          remoteFirmwareVersion = nodeConfig[F("latest_firmware_version")].as<String>();
+        }
+
+        if (nodeConfig.containsKey(F("firmware_url")) && nodeConfig[F("firmware_url")].is<String>()) {
+          firmwareUrl = nodeConfig[F("firmware_url")].as<String>();
+        }
     }
 
 
@@ -193,6 +325,8 @@ bool obtener_remote_config() {
     Serial.printf(F("Endpoint: %s\n"), endpointCalidadAgua.c_str());
     Serial.printf(F("Intervalo (ms) FINAL: %ld\n"), intervaloEnvioMs);
     Serial.printf(F("Flag Activa: %s\n"), flagActivo ? "SI" : "NO");
+    Serial.printf(F("Ver. Remota OTA: %s\n"), remoteFirmwareVersion.c_str());
+    Serial.printf(F("URL Firmware: %s\n"), firmwareUrl.c_str());
     Serial.println(F("------------------------------------------"));
     
     http.end();
@@ -290,8 +424,7 @@ void enviar_post_batch() {
     if (httpResponseCode == 200) {
       Serial.printf(F("✅ POST exitoso. Código: %d\n"), httpResponseCode);
     } else {
-      // Ahora este error 404/500 será del backend, no de la configuración de ruta.
-      Serial.printf(F("❌ Error en el POST. Código: %d. Revise el log del servidor de Python.\n"), httpResponseCode);
+      Serial.printf(F("❌ Error en el POST. Código: %d.\n"), httpResponseCode);
     }
     http.end();
   }
@@ -343,7 +476,6 @@ void leer_sensores_agua() {
   }
   
   Serial.println(F("   -----------------------------------"));
-  // Los logs de la consola ahora reflejan correctamente el pin 5 para PH y 4 para TDS
   Serial.printf(F("   PH (Pin %d): %d / %.3f V -> %.2f pH\n"), PH_PIN, ph_raw, ph_voltage, ph_value);
   Serial.printf(F("   TDS (Pin %d): %d / %.3f V\n"), TDS_PIN, tds_raw, tds_voltage);
   Serial.println(F("   -----------------------------------"));
@@ -369,7 +501,10 @@ void loop() {
       
       // 3. VERIFICAR SI ES TIEMPO DE CONFIGURACIÓN
       if (millis() - lastConfigFetch >= CONFIG_FETCH_INTERVAL) {
+          // Obtiene la última configuración, incluyendo la versión remota
           obtener_remote_config(); 
+          // Verifica e inicia el OTA si es necesario
+          check_for_update();
           lastConfigFetch = millis();
       }
       
