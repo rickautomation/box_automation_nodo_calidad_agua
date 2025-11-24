@@ -1,38 +1,52 @@
 /*
- * SKETCH: arduino_remote_config_c5_final.ino
- * OBJETIVO: Versión final del código con configuración dinámica y OTA totalmente funcional
- * * * CORRECCIONES:
- * 1. ERROR DE COMPILACIÓN SOLUCIONADO: Se corrigió la función perform_update() para escribir
- * correctamente el flujo de datos HTTP en el proceso de actualización OTA, eliminando el
- * error 'cannot convert 'UpdateClass' to 'Stream*'.
- * 2. CLAVE NODO: Corregida de "NODO_AGUA" a "NODO_H2O" para coincidir con la RTDB.
- * 3. FUNCIONALIDAD OTA: Implementación completa de la lógica de comparación de versiones,
- * descarga segura (HTTPS) y flasheo del firmware Over-The-Air.
+ * SKETCH: nodo_h2o.ino
+ * OBJETIVO: Versión final con CONFIGURACIÓN WIFI VÍA PORTAL CAUTIVO, 
+ * Configuración Dinámica desde Firebase y Actualización OTA.
+ * * * * IMPLEMENTACIÓN DE PORTAL CAUTIVO:
+ * 1. Uso de Preferences.h para guardar SSID y Password de forma persistente (NVS).
+ * 2. Si no hay credenciales o falla la conexión, el ESP32 crea un Access Point (AP).
+ * 3. Se sirve una página HTML para que el usuario ingrese la red y clave.
+ * 4. Las nuevas credenciales se guardan y el ESP32 se reinicia para usar la nueva configuración.
  */
 
 #include <WiFi.h>              
 #include <HTTPClient.h>        
 #include <ArduinoJson.h>       
-#include <Update.h>            // Librería para la actualización OTA
-#include <WiFiClientSecure.h>  // Cliente seguro para HTTPS (necesario para GitHub raw)
+#include <Update.h>            
+#include <WiFiClientSecure.h>  
+#include <Preferences.h>        // 🛠️ Nuevo: Para almacenamiento persistente (NVS)
+#include <WebServer.h>          // 🛠️ Nuevo: Para servir el portal web
+#include <DNSServer.h>          // 🛠️ Nuevo: Para redirigir el tráfico al portal
 
 // ======================================================
 // 0. VERSIÓN LOCAL DEL FIRMWARE (DEFINE LA VERSIÓN ACTUAL)
 // ======================================================
-// ⚠️ ESTE VALOR DEBE INCREMENTARSE EN CADA NUEVA COMPILACIÓN
 const char* FIRMWARE_VERSION_CODE = "1.0.0";
 
 
 // ======================================================
-// 1. CONFIGURACIÓN DE LA RED WIFI Y FIREBASE
+// 1. CONFIGURACIÓN DE RED, FIREBASE Y PORTAL CAUTIVO
 // ======================================================
-// ⚠️ MODIFICAR CON TU RED
-const char* ssid = "tili";         
-const char* password = "Ubuntu1234$"; 
 
 // ⚠️ REEMPLAZAR CON TUS CLAVES Y HOST
 const char* API_KEY = "AIzaSyAxGSXV2br1SsFu7YyP6NZaTXc_Z40uqA8"; 
 const char* RTDB_HOST = "arduinoconfigremota-default-rtdb.firebaseio.com";                   
+
+// 🛠️ VARIABLES GLOBALES PARA EL PORTAL CAUTIVO Y NVS
+Preferences preferences;
+WebServer server(80);
+DNSServer dnsServer;
+
+// Claves de almacenamiento persistente
+const char* PREFS_NAMESPACE = "wifi_config";
+const char* PREF_SSID = "ssid";
+const char* PREF_PASS = "pass";
+const char* AP_SSID = "NODO_H2O_SETUP"; // SSID del Punto de Acceso para configuración
+
+// Variables de credenciales leídas o ingresadas
+String loadedSsid = "";
+String loadedPassword = "";
+
 
 // ======================================================
 // 2. VARIABLES DE CONFIGURACIÓN DINÁMICA (LEÍDAS DE FIREBASE)
@@ -43,31 +57,27 @@ int backendPort = 3000;
 String endpointCalidadAgua = "/sensor-data/arduino/batch"; 
 long intervaloEnvioMs = 60000;           
 bool flagActivo = true;                  
-String latestFirmwareVersion = "0.0.0";  // Versión actual del firmware cargado
-String remoteFirmwareVersion = "0.0.0";  // Versión remota de Firebase
-String firmwareUrl = "";                 // URL del binario para OTA
+String latestFirmwareVersion = "0.0.0";  
+String remoteFirmwareVersion = "0.0.0"; 
+String firmwareUrl = "";                 
 
-// URL BASE: Apunta a la raíz para leer todo el objeto de configuración
 const String RTDB_CONFIG_URL_BASE = "https://" + String(RTDB_HOST) + "/.json";
 
 
 // ======================================================
-// 3. DATOS DEL DISPOSITIVO Y SENSORES (Parámetros)
+// 3. DATOS DEL DISPOSITIVO Y SENSORES 
 // ======================================================
 const char* BOX_SERIAL_ID = "eea11eb7-e5eb-45d7-be52-69ff8d15e6e-AGUA"; 
-// 🔑 CLAVE ÚNICA DEL NODO: CORREGIDA a "NODO_H2O"
 const char* NODE_TYPE_KEY = "NODO_H2O"; 
 
-// PINES CORREGIDOS DEFINITIVAMENTE: 
-const int PH_PIN = 5;       // PH en GPIO 5
-const int TDS_PIN = 4;      // TDS en GPIO 4
+const int PH_PIN = 5;       
+const int TDS_PIN = 4;      
 
 const int TIEMPO_MAX_CONEXION_WIFI = 20000; 
 
 // Parámetros ADC y Calibración
 const int ADC_MAX_VALUE = 4095;
 const float ADC_VOLTAGE_REF = 3.3; 
-// ⚠️ CALIBRACIÓN PH: Reemplaza con tus valores reales
 const float PH_V4 = 0.4;    
 const float PH_V7 = 1.1;    
 float ph_slope = 0;         
@@ -86,7 +96,7 @@ float tds_value = 0.0;
 // 4. GESTIÓN DEL TIEMPO 
 // ======================================================
 unsigned long lastConfigFetch = 0; 
-const long CONFIG_FETCH_INTERVAL = 60000; // 60 segundos (Frecuencia para verificar la config/OTA)
+const long CONFIG_FETCH_INTERVAL = 60000; 
 
 // Declaraciones de funciones
 void configurar_adc();
@@ -99,6 +109,13 @@ int compareVersions(String current, String remote);
 bool check_for_update();
 void perform_update();
 
+// 🛠️ Funciones del Portal Cautivo
+void saveCredentials(const String& ssid, const String& password);
+bool loadCredentials();
+void startConfigPortal();
+void handleRoot();
+void handleSave();
+
 
 // ======================================================
 // SETUP: Inicialización de Sensores y Config
@@ -110,33 +127,225 @@ void setup() {
   configurar_adc();
   calcular_calibracion_ph();
 
-  // Guardamos la versión local definida
   latestFirmwareVersion = String(FIRMWARE_VERSION_CODE); 
   
-  Serial.println(F("\n--- 💧 Nodo de Monitoreo de Agua con Configuración Dinámica y OTA ---"));
-  Serial.printf(F("ID: %s\n"), BOX_SERIAL_ID);
+  Serial.println(F("\n--- 💧 Nodo de Monitoreo de Agua ---"));
   Serial.printf(F("VERSIÓN ACTUAL (Local): %s\n"), latestFirmwareVersion.c_str());
   
-  if (conectar_wifi()) {
-      // Intentamos obtener la configuración remota y las versiones
+  // 1. INICIAR NVS (Preferencias)
+  preferences.begin(PREFS_NAMESPACE, false);
+
+  // 2. INTENTAR CARGAR Y CONECTAR CON CREDENCIALES GUARDADAS
+  bool credentialsLoaded = loadCredentials();
+  
+  if (credentialsLoaded && conectar_wifi()) {
+      // ÉXITO: Conectado a Wi-Fi
+      Serial.println(F("✅ Conexión Wi-Fi exitosa con credenciales guardadas."));
+      // Continuar con la lógica remota
       obtener_remote_config();
-      // Verificamos si hay OTA inmediatamente después de obtener la config inicial
       check_for_update();
       lastConfigFetch = millis();
+  } else {
+      // FALLO: No hay credenciales o la conexión falló
+      Serial.println(F("❌ Fallo al conectar con credenciales guardadas o no hay credenciales."));
+      Serial.println(F("📡 Iniciando Portal Cautivo para configuración Wi-Fi..."));
+      // 3. INICIAR PORTAL
+      startConfigPortal();
+      // El código se detiene aquí hasta que el usuario configura y el ESP se reinicia
+  }
+}
+
+// ======================================================
+// FUNCIONES DEL PORTAL CAUTIVO Y NVS (NUEVAS)
+// ======================================================
+
+/**
+ * @brief Guarda SSID y Password en la memoria NVS.
+ */
+void saveCredentials(const String& ssid, const String& password) {
+  preferences.putString(PREF_SSID, ssid);
+  preferences.putString(PREF_PASS, password);
+  Serial.printf(F("💾 Credenciales guardadas: SSID = %s\n"), ssid.c_str());
+}
+
+/**
+ * @brief Carga SSID y Password de la memoria NVS.
+ * @return true si se encontraron credenciales válidas.
+ */
+bool loadCredentials() {
+  loadedSsid = preferences.getString(PREF_SSID, "");
+  loadedPassword = preferences.getString(PREF_PASS, "");
+  
+  if (loadedSsid.length() > 0) {
+    Serial.printf(F("📝 Credenciales cargadas: SSID = %s\n"), loadedSsid.c_str());
+    return true;
+  }
+  Serial.println(F("📝 No se encontraron credenciales guardadas."));
+  return false;
+}
+
+/**
+ * @brief Inicializa el Access Point y el Servidor Web para la configuración.
+ */
+void startConfigPortal() {
+  // Configura el ESP como Access Point (AP)
+  WiFi.mode(WIFI_AP);
+  // IP del AP: 192.168.4.1
+  IPAddress localIP(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  
+  WiFi.softAPConfig(localIP, gateway, subnet);
+  WiFi.softAP(AP_SSID);
+  
+  Serial.printf(F("AP creado. Conéctate a '%s' para configurar.\n"), AP_SSID);
+  Serial.println(F("IP del portal: 192.168.4.1"));
+
+  // Iniciar DNS (redirige todas las peticiones a la IP del portal)
+  dnsServer.start(53, "*", localIP);
+  
+  // Rutas del servidor web
+  server.on("/", handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.begin();
+
+  // Bucle infinito del portal (se sale con ESP.restart() en handleSave)
+  while (true) {
+    dnsServer.processNextRequest();
+    server.handleClient();
+    delay(1);
+  }
+}
+
+/**
+ * @brief Sirve la página HTML del formulario.
+ */
+void handleRoot() {
+  String html = R"raw(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Configuración NODO H2O</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 20px; background-color: #f4f7f6; }
+    .container { max-width: 400px; margin: auto; padding: 25px; background: #ffffff; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+    h1 { color: #00796B; margin-bottom: 20px; font-size: 24px; }
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      padding: 12px;
+      margin: 10px 0 20px 0;
+      display: inline-block;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      box-sizing: border-box;
+      font-size: 16px;
+    }
+    input[type="submit"] {
+      background-color: #00796B;
+      color: white;
+      padding: 14px 20px;
+      margin: 8px 0;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      width: 100%;
+      font-size: 18px;
+      transition: background-color 0.3s;
+    }
+    input[type="submit"]:hover { background-color: #004D40; }
+    .footer { margin-top: 20px; color: #757575; font-size: 14px; }
+    .logo { color: #00796B; font-size: 30px; margin-bottom: 10px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="logo">💧</div>
+  <h1>Configura tu Nodo H2O</h1>
+  <p>Conéctate a tu red Wi-Fi para que el nodo pueda enviar datos.</p>
+  <form method="POST" action="/save">
+    <label for="ssid">SSID (Nombre de la Red):</label>
+    <input type="text" id="ssid" name="ssid" required placeholder="MiRedWiFi">
+    <label for="password">Contraseña:</label>
+    <input type="password" id="password" name="password" placeholder="Dejar vacío si no tiene clave">
+    <input type="submit" value="Guardar y Conectar">
+  </form>
+  <div class="footer">Version Firmware: 1.0.0</div>
+</div>
+</body>
+</html>
+)raw";
+  server.send(200, "text/html", html);
+}
+
+/**
+ * @brief Procesa el formulario, guarda las credenciales y reinicia.
+ */
+void handleSave() {
+  String newSsid = server.arg("ssid");
+  String newPassword = server.arg("password");
+  
+  if (newSsid.length() > 0) {
+    saveCredentials(newSsid, newPassword);
+    
+    String successHtml = R"raw(
+      <!DOCTYPE html><html><head><meta http-equiv="refresh" content="5;url=/" /></head><body>
+      <div style="text-align: center; margin-top: 50px;">
+        <h1>✅ Credenciales Guardadas</h1>
+        <p>Intentando conectar a la red: <strong>)raw" + newSsid + R"raw(</strong></p>
+        <p>El nodo se reiniciará en 5 segundos para aplicar la nueva configuración.</p>
+      </div>
+      </body></html>
+    )raw";
+    server.send(200, "text/html", successHtml);
+    
+    // Finaliza el servidor, libera la memoria y reinicia
+    server.stop();
+    dnsServer.stop();
+    Serial.println(F("🔄 Reiniciando ESP32..."));
+    ESP.restart();
+  } else {
+    server.send(200, "text/html", "<h1>❌ ERROR: SSID vacío.</h1><p>Vuelve al portal e introduce un nombre de red válido.</p>");
+  }
+}
+
+
+// ======================================================
+// FUNCIONES DE CONEXIÓN WIFI (ACTUALIZADA)
+// ======================================================
+
+bool conectar_wifi() {
+  Serial.print(F("\n📡 Encendiendo Wi-Fi y conectando..."));
+  WiFi.mode(WIFI_STA);
+  
+  // Usar las credenciales cargadas/guardadas
+  WiFi.begin(loadedSsid.c_str(), loadedPassword.c_str());
+
+  unsigned long inicio = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - inicio < TIEMPO_MAX_CONEXION_WIFI)) {
+    delay(500);
+    Serial.print(F("."));
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf(F("\n✅ WiFi Conectado. IP: %s\n"), WiFi.localIP().toString().c_str());
+    return true;
+  } else {
+    Serial.printf(F("\n❌ Falló la conexión a WiFi después de %d ms.\n"), TIEMPO_MAX_CONEXION_WIFI);
+    return false;
   }
 }
 
 // ----------------------------------------------------
-// FUNCIONES DE CONFIGURACIÓN VÍA REST API Y OTA
+// FUNCIONES DE CONFIGURACIÓN VÍA REST API Y OTA (SIN CAMBIOS FUNCIONALES)
 // ----------------------------------------------------
 
 // Compara versiones en formato "X.Y.Z"
-// Retorna -1 si current < remote, 0 si son iguales, 1 si current > remote
 int compareVersions(String current, String remote) {
   int cur_v[3] = {0, 0, 0};
   int rem_v[3] = {0, 0, 0};
 
-  // Parsea las cadenas de versión (X.Y.Z)
   sscanf(current.c_str(), "%d.%d.%d", &cur_v[0], &cur_v[1], &cur_v[2]);
   sscanf(remote.c_str(), "%d.%d.%d", &rem_v[0], &rem_v[1], &rem_v[2]);
 
@@ -144,7 +353,7 @@ int compareVersions(String current, String remote) {
     if (cur_v[i] < rem_v[i]) return -1;
     if (cur_v[i] > rem_v[i]) return 1;
   }
-  return 0; // Versiones iguales
+  return 0; 
 }
 
 // Verifica si la versión remota es superior a la versión actual
@@ -180,9 +389,7 @@ void perform_update() {
       return;
   }
 
-  // Usamos WiFiClientSecure para la conexión HTTPS a GitHub
   WiFiClientSecure client;
-  // Permite conexiones HTTPS sin verificar el certificado (más fácil para GitHub raw)
   client.setInsecure(); 
   
   HTTPClient http;
@@ -199,15 +406,7 @@ void perform_update() {
       if (canBegin) {
         Serial.println(F("Iniciando proceso de flasheo..."));
         
-        // 🟢 SOLUCIÓN DEL ERROR: Usamos http.getStream() para obtener el flujo de datos
-        // y luego lo escribimos a Update.
-        // http.getStream() retorna un objeto Stream, compatible con Update.writeStream()
-        
-        // Obtenemos un puntero al Stream de datos de la respuesta HTTP
         WiFiClient* stream = http.getStreamPtr(); 
-        
-        // Escribimos el contenido del stream (binario) al proceso de actualización
-        // Esto es más seguro y maneja la transferencia chunk por chunk
         size_t written = Update.writeStream(*stream);
         
         if (written == contentLength) {
@@ -218,7 +417,6 @@ void perform_update() {
         
         if (Update.end()) {
           Serial.println(F("✅ Actualización finalizada exitosamente. Reiniciando..."));
-          // Reinicio forzado después de la actualización exitosa
           ESP.restart(); 
         } else {
           Serial.printf(F("❌ Error al finalizar la actualización. Error: %d. Mensaje: %s\n"), Update.getError(), Update.errorString());
@@ -245,9 +443,6 @@ bool obtener_remote_config() {
   }
   
   String fullUrl = RTDB_CONFIG_URL_BASE + "?auth=" + String(API_KEY); 
-  
-  Serial.printf(F("Nodo a buscar en RTDB: %s\n"), NODE_TYPE_KEY);
-  
   long oldIntervaloEnvioMs = intervaloEnvioMs; 
 
   HTTPClient http;
@@ -259,7 +454,6 @@ bool obtener_remote_config() {
     Serial.printf(F("✅ Configuración obtenida. Código HTTP: %d\n"), httpCode);
     String payload = http.getString();
     
-    // Aumentamos el buffer a 1536 para la estructura anidada completa con OTA
     DynamicJsonDocument doc(1536); 
     DeserializationError error = deserializeJson(doc, payload);
 
@@ -269,46 +463,36 @@ bool obtener_remote_config() {
       return false;
     }
 
-    // 1. Acceso a la configuración GENERAL bajo "remote_config"
     JsonObject remoteConfig = doc[F("remote_config")];
     if (remoteConfig.isNull()) {
         Serial.println(F("❌ Fallo: Objeto 'remote_config' no encontrado. Usando fallbacks."));
     } else {
-        // A. CONFIGURACIÓN GENERAL
         if (remoteConfig.containsKey(F("backend_host")) && remoteConfig[F("backend_host")].is<String>()) {
           backendHost = remoteConfig[F("backend_host")].as<String>();
         }
-
         if (remoteConfig.containsKey(F("backend_port")) && remoteConfig[F("backend_port")].is<int>()) {
           backendPort = remoteConfig[F("backend_port")].as<int>();
         }
-
         if (remoteConfig.containsKey(F("endpoint_calidad_agua")) && remoteConfig[F("endpoint_calidad_agua")].is<String>()) {
           endpointCalidadAgua = remoteConfig[F("endpoint_calidad_agua")].as<String>();
         }
-        
         if (remoteConfig.containsKey(F("flag_activo")) && remoteConfig[F("flag_activo")].is<bool>()) {
           flagActivo = remoteConfig[F("flag_activo")].as<bool>();
         }
     }
 
-
-    // 2. Acceso a la configuración ESPECÍFICA del nodo bajo "firmware_updates/[NODE_TYPE_KEY]"
     JsonObject nodeConfig = doc[F("firmware_updates")][NODE_TYPE_KEY];
     if (nodeConfig.isNull()) {
         Serial.printf(F("❌ Fallo: Configuración de nodo '%s' no encontrada bajo 'firmware_updates'. Usando fallbacks.\n"), NODE_TYPE_KEY);
     } else {
-        // B. INTERVALO ESPECÍFICO DEL NODO
         if (nodeConfig.containsKey(F("intervalo_envio_ms")) && nodeConfig[F("intervalo_envio_ms")].is<long>()) {
           long newIntervalo = nodeConfig[F("intervalo_envio_ms")].as<long>();
-          
           if (newIntervalo != oldIntervaloEnvioMs) {
              intervaloEnvioMs = newIntervalo;
              Serial.printf(F("🟢 LOG: INTERVALO ACTUALIZADO: Nuevo valor remoto = %ld ms\n"), intervaloEnvioMs);
           } 
         }
 
-        // C. VERSIÓN Y URL DEL FIRMWARE PARA OTA
         if (nodeConfig.containsKey(F("latest_firmware_version")) && nodeConfig[F("latest_firmware_version")].is<String>()) {
           remoteFirmwareVersion = nodeConfig[F("latest_firmware_version")].as<String>();
         }
@@ -321,48 +505,15 @@ bool obtener_remote_config() {
 
     Serial.println(F("------------------------------------------"));
     Serial.println(F("Configuración Dinámica Aplicada:"));
-    Serial.printf(F("Host: %s\n"), backendHost.c_str());
-    Serial.printf(F("Endpoint: %s\n"), endpointCalidadAgua.c_str());
     Serial.printf(F("Intervalo (ms) FINAL: %ld\n"), intervaloEnvioMs);
-    Serial.printf(F("Flag Activa: %s\n"), flagActivo ? "SI" : "NO");
     Serial.printf(F("Ver. Remota OTA: %s\n"), remoteFirmwareVersion.c_str());
-    Serial.printf(F("URL Firmware: %s\n"), firmwareUrl.c_str());
     Serial.println(F("------------------------------------------"));
     
     http.end();
     return true;
   } else {
-    // Si falla, se usa la configuración por defecto (fallback)
     Serial.printf(F("❌ Fallo al obtener la configuración (HTTP Code: %d). Usando valores por defecto.\n"), httpCode);
     http.end();
-    return false;
-  }
-}
-
-
-// ----------------------------------------------------
-// FUNCIÓN DE CONEXIÓN WIFI 
-// ----------------------------------------------------
-bool conectar_wifi() {
-  Serial.print(F("\n📡 Encendiendo Wi-Fi para enviar datos..."));
-  WiFi.disconnect(true); 
-  WiFi.mode(WIFI_OFF);
-  
-  WiFi.mode(WIFI_STA);
-  WiFi.setTxPower(WIFI_POWER_8_5dBm); 
-  WiFi.begin(ssid, password);
-
-  unsigned long inicio = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - inicio < TIEMPO_MAX_CONEXION_WIFI)) {
-    delay(500);
-    Serial.print(F("."));
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf(F("\n✅ WiFi Conectado. IP: %s\n"), WiFi.localIP().toString().c_str());
-    return true;
-  } else {
-    Serial.println(F("\n❌ Fallo la conexión a WiFi."));
     return false;
   }
 }
@@ -409,7 +560,6 @@ void enviar_post_batch() {
   
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    // URL completa para el backend (usa el endpoint dinámico)
     String url = "http://" + backendHost + ":" + String(backendPort) + endpointCalidadAgua; 
     
     Serial.printf(F("URL de envío: %s\n"), url.c_str());
@@ -439,20 +589,14 @@ void configurar_adc() {
 }
 
 void calcular_calibracion_ph() {
-    // Calculo simple de pendiente y offset para el pH
     ph_slope = (4.0 - 7.0) / (PH_V4 - PH_V7);
     ph_offset = 7.0 - (ph_slope * PH_V7);
     
-    Serial.println(F("------------------------------------------"));
-    Serial.println(F("CALIBRACIÓN PH (Valores por defecto):"));
-    Serial.printf(F("Pendiente (Slope): %.2f\n"), ph_slope);
-    Serial.printf(F("Intersección (Offset): %.2f\n"), ph_offset);
-    Serial.println(F("------------------------------------------"));
+    Serial.printf(F("CALIBRACIÓN PH: Pendiente: %.2f, Intersección: %.2f\n"), ph_slope, ph_offset);
 }
 
 
 void leer_sensores_agua() {
-  Serial.println(F("💧 Iniciando lectura de sensores..."));
   
   // 1. LECTURA pH (GPIO 5)
   delay(10); 
@@ -461,24 +605,20 @@ void leer_sensores_agua() {
   ph_value = ph_slope * ph_voltage + ph_offset;
 
   if (ph_raw <= 5 || ph_raw >= ADC_MAX_VALUE - 5) {
-      Serial.println(F("⚠️ ALERTA PH: Lectura en extremos. Revisa conexión y calibración."));
+      Serial.println(F("⚠️ ALERTA PH: Lectura en extremos. Revisa conexión."));
   }
   
   // 2. LECTURA TDS (GPIO 4)
   delay(10); 
   tds_raw = analogRead(TDS_PIN);
   tds_voltage = (float)tds_raw * (ADC_VOLTAGE_REF / ADC_MAX_VALUE);
-  tds_value = 0.0; // TDS real requiere compensación de temperatura
+  tds_value = 0.0; 
   
-  // ⚠️ MENSAJE DE ALERTA: Si la lectura es cero (0V)
   if (tds_raw == 0) {
-      Serial.printf(F("❌ ERROR TDS: Lectura RAW es CERO (0). Verifica la conexión física en el pin GPIO %d.\n"), TDS_PIN);
+      Serial.printf(F("❌ ERROR TDS: Lectura RAW es CERO (0) en GPIO %d.\n"), TDS_PIN);
   }
   
-  Serial.println(F("   -----------------------------------"));
-  Serial.printf(F("   PH (Pin %d): %d / %.3f V -> %.2f pH\n"), PH_PIN, ph_raw, ph_voltage, ph_value);
-  Serial.printf(F("   TDS (Pin %d): %d / %.3f V\n"), TDS_PIN, tds_raw, tds_voltage);
-  Serial.println(F("   -----------------------------------"));
+  Serial.printf(F("   PH: %.2f pH / TDS: %.3f V\n"), ph_value, tds_voltage);
 }
 
 
@@ -486,6 +626,8 @@ void leer_sensores_agua() {
 // BUCLE PRINCIPAL (LÓGICA DE TIEMPO Y CONFIGURACIÓN)
 // ----------------------------------------------------
 void loop() {
+  
+  // Si el portal cautivo está activo, el código nunca llega aquí.
   
   // 1. LECTURA DE SENSORES
   leer_sensores_agua();
@@ -501,9 +643,7 @@ void loop() {
       
       // 3. VERIFICAR SI ES TIEMPO DE CONFIGURACIÓN
       if (millis() - lastConfigFetch >= CONFIG_FETCH_INTERVAL) {
-          // Obtiene la última configuración, incluyendo la versión remota
           obtener_remote_config(); 
-          // Verifica e inicia el OTA si es necesario
           check_for_update();
           lastConfigFetch = millis();
       }
@@ -512,17 +652,18 @@ void loop() {
       enviar_post_batch();
       
       // 5. DESCONEXIÓN 
-      Serial.println(F("\n🔌 Desconectando Wi-Fi..."));
+      Serial.println(F("\n🔌 Desconectando Wi-Fi para ahorrar energía..."));
       WiFi.disconnect(true); 
       WiFi.mode(WIFI_OFF);
       
   } else {
-    Serial.println(F("❌ No se pudo establecer conexión. Saltando envío y usando el intervalo anterior."));
+    // Si falla la conexión en LOOP, reinicia para intentar el portal cautivo si es necesario.
+    Serial.println(F("❌ Fallo la reconexión en LOOP. Reiniciando para forzar reintento/portal."));
+    delay(5000);
+    ESP.restart();
   }
   
   // 6. ESPERA
-  Serial.printf(F("💤 Entrando en espera por %ld ms (Intervalo Remoto).\n"), intervaloEnvioMs);
+  Serial.printf(F("💤 Entrando en espera por %ld ms.\n"), intervaloEnvioMs);
   delay(intervaloEnvioMs); 
-  
-  Serial.println(F("\n🔄 Despertando y reiniciando ciclo..."));
 }
