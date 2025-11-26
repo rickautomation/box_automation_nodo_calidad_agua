@@ -2,11 +2,8 @@
  * SKETCH: nodo_h2o.ino
  * OBJETIVO: Versión final con CONFIGURACIÓN WIFI VÍA PORTAL CAUTIVO, 
  * Configuración Dinámica desde Firebase y Actualización OTA.
- * * * * * * IMPLEMENTACIÓN DE PORTAL CAUTIVO:
- * 1. Uso de Preferences.h para guardar SSID y Password de forma persistente (NVS).
- * 2. Si no hay credenciales o falla la conexión, el ESP32 crea un Access Point (AP).
- * 3. Se sirve una página HTML para que el usuario ingrese la red y clave.
- * 4. Las nuevas credenciales se guardan y el ESP32 se reinicia para usar la nueva configuración.
+ * * MEJORA: Implementación de la función "Reset de Credenciales"
+ * usando el botón físico BOOT (GPIO 9) del ESP32-C3 Mini.
  */
 
 #include <WiFi.h>              
@@ -21,8 +18,7 @@
 // ======================================================
 // 0. VERSIÓN LOCAL DEL FIRMWARE (DEFINE LA VERSIÓN ACTUAL)
 // ======================================================
-const char* FIRMWARE_VERSION_CODE = "1.0.3";
-
+const char* FIRMWARE_VERSION_CODE = "1.0.4";
 
 // ======================================================
 // 1. CONFIGURACIÓN DE RED, FIREBASE Y PORTAL CAUTIVO
@@ -33,7 +29,6 @@ const char* API_KEY = "AIzaSyAxGSXV2br1SsFu7YyP6NZaTXc_Z40uqA8";
 const char* RTDB_HOST = "arduinoconfigremota-default-rtdb.firebaseio.com";                   
 
 // 🔑 CREDENCIALES POR DEFECTO PARA FORZAR CONEXIÓN INICIAL 🔑
-// Útil para la primera carga del firmware sin tener que usar el Portal Cautivo.
 const char* DEFAULT_SSID = "tili";         
 const char* DEFAULT_PASS = "Ubuntu1234$"; 
 
@@ -52,6 +47,9 @@ const char* AP_SSID = "NODO_H2O_SETUP"; // SSID del Punto de Acceso para configu
 // Variables de credenciales leídas o ingresadas
 String loadedSsid = "";
 String loadedPassword = "";
+
+// 🛠️ PIN DE RESETEO DE WIFI: USAMOS EL BOTÓN FÍSICO "BOOT" (GPIO 9)
+const int WIFI_RESET_PIN = 9; 
 
 
 // ======================================================
@@ -118,7 +116,7 @@ void perform_update();
 // 🛠️ Funciones del Portal Cautivo y NVS
 void saveCredentials(const String& ssid, const String& password);
 bool loadCredentials();
-void clearCredentials(); // ⬅️ Función para forzar el portal borrando credenciales
+void clearCredentials(); 
 void startConfigPortal();
 void handleRoot();
 void handleSave();
@@ -142,20 +140,38 @@ void setup() {
   // 1. INICIAR NVS (Preferencias)
   preferences.begin(PREFS_NAMESPACE, false);
 
-  // 🔴 LÍNEA DE PRUEBA: DESCOMENTA ESTA LÍNEA TEMPORALMENTE PARA FORZAR EL PORTAL CAUTIVO
-  clearCredentials(); 
-
-  // 2. INTENTAR CARGAR CREDENCIALES GUARDADAS
-  bool credentialsLoaded = loadCredentials();
+  // 2. CONFIGURACIÓN DEL PIN DEL BOTÓN BOOT (GPIO 9)
+  // El botón BOOT generalmente ya tiene un PULLUP interno.
+  pinMode(WIFI_RESET_PIN, INPUT_PULLUP);
+  delay(50); // Pequeña espera para estabilización
   
-  // 🔑 LÓGICA AGREGADA: Si no hay credenciales, fuerza las predeterminadas y las guarda
-  if (!credentialsLoaded) {
-      Serial.println(F("🟡 INFO: No hay credenciales guardadas. Forzando credenciales por defecto..."));
-      saveCredentials(DEFAULT_SSID, DEFAULT_PASS); // Guarda las credenciales "tili"
-      credentialsLoaded = loadCredentials(); // Vuelve a cargar para que las variables tengan los valores
+  // 3. LÓGICA DEL BOTÓN DE RESET: Presionar BOOT (GPIO 9 a LOW) durante el arranque
+  // La lógica es: si el botón se mantiene presionado, el pin estará en LOW.
+  if (digitalRead(WIFI_RESET_PIN) == LOW) {
+    Serial.println(F("🚨 BOTÓN BOOT DETECTADO (GPIO 9 LOW). BORRANDO CREDENCIALES Y FORZANDO PORTAL..."));
+    clearCredentials(); 
+    // Después de borrar, hay que esperar un poco para que el usuario suelte el botón
+    Serial.println(F("Presiona el botón RESET/EN para continuar con la configuración."));
+    // En este punto, el ESP32 queda esperando a que el usuario presione RESET/EN o se reinicie.
+    
+    // Una alternativa es reiniciar directamente aquí, pero es mejor que el usuario lo haga:
+    // while (digitalRead(WIFI_RESET_PIN) == LOW) { delay(100); } // Esperar a que se suelte el BOOT
+    // ESP.restart(); 
   }
   
-  // 3. INTENTAR CONECTAR CON LAS CREDENCIALES (Cargadas o por defecto)
+  // 4. INTENTAR CARGAR CREDENCIALES GUARDADAS
+  bool credentialsLoaded = loadCredentials();
+  
+  // 🔑 LÓGICA DE FALLBACK: Si no hay credenciales, fuerza las predeterminadas y las guarda
+  if (!credentialsLoaded) {
+      Serial.println(F("🟡 INFO: No hay credenciales guardadas. Forzando credenciales por defecto..."));
+      // Guardar las credenciales por defecto para el primer intento de conexión
+      saveCredentials(DEFAULT_SSID, DEFAULT_PASS); 
+      loadCredentials();
+      credentialsLoaded = true; 
+  }
+  
+  // 5. INTENTAR CONECTAR CON LAS CREDENCIALES (Cargadas o por defecto)
   if (credentialsLoaded && conectar_wifi()) {
       // ÉXITO: Conectado a Wi-Fi
       Serial.println(F("✅ Conexión Wi-Fi exitosa con credenciales guardadas."));
@@ -166,8 +182,10 @@ void setup() {
   } else {
       // FALLO: La conexión con las credenciales (por defecto o guardadas) falló.
       Serial.println(F("❌ Fallo al conectar con credenciales."));
+      
+      // Si el código llegó aquí después de un reseteo forzado, es cuando se activa el portal.
       Serial.println(F("📡 Iniciando Portal Cautivo para configuración Wi-Fi..."));
-      // 4. INICIAR PORTAL
+      // 6. INICIAR PORTAL
       startConfigPortal();
       // El código se detiene aquí hasta que el usuario configura y el ESP se reinicia
   }
@@ -183,6 +201,8 @@ void setup() {
 void saveCredentials(const String& ssid, const String& password) {
   preferences.putString(PREF_SSID, ssid);
   preferences.putString(PREF_PASS, password);
+  loadedSsid = ssid;
+  loadedPassword = password;
   Serial.printf(F("💾 Credenciales guardadas: SSID = %s\n"), ssid.c_str());
 }
 
@@ -203,12 +223,12 @@ bool loadCredentials() {
 
 /**
  * @brief Borra las credenciales de Wi-Fi de la NVS (SSID y PASS).
- * Esto obliga al ESP a iniciar el Portal Cautivo si la conexión por defecto falla 
- * o si no hay credenciales por defecto configuradas.
  */
 void clearCredentials() {
     preferences.remove(PREF_SSID);
     preferences.remove(PREF_PASS);
+    loadedSsid = "";
+    loadedPassword = "";
     Serial.println(F("🗑️ CREDENCIALES BORRADAS DE NVS."));
 }
 
@@ -293,6 +313,9 @@ void handleRoot() {
   <div class="logo">💧</div>
   <h1>Configura tu Nodo H2O</h1>
   <p>Conéctate a tu red Wi-Fi para que el nodo pueda enviar datos.</p>
+  <p style="font-size: 12px; color: #B00020;">
+    Para resetear la configuración, mantén presionado el botón BOOT al iniciar.
+  </p>
   <form method="POST" action="/save">
     <label for="ssid">SSID (Nombre de la Red):</label>
     <input type="text" id="ssid" name="ssid" required placeholder="MiRedWiFi">
