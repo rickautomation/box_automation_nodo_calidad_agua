@@ -2,7 +2,7 @@
  * SKETCH: nodo_h2o.ino
  * OBJETIVO: Versión final con CONFIGURACIÓN WIFI VÍA PORTAL CAUTIVO, 
  * Configuración Dinámica desde Firebase y Actualización OTA.
- * * * * * IMPLEMENTACIÓN DE PORTAL CAUTIVO:
+ * * * * * * IMPLEMENTACIÓN DE PORTAL CAUTIVO:
  * 1. Uso de Preferences.h para guardar SSID y Password de forma persistente (NVS).
  * 2. Si no hay credenciales o falla la conexión, el ESP32 crea un Access Point (AP).
  * 3. Se sirve una página HTML para que el usuario ingrese la red y clave.
@@ -14,14 +14,14 @@
 #include <ArduinoJson.h>       
 #include <Update.h>            
 #include <WiFiClientSecure.h>  
-#include <Preferences.h>        // 🛠️ Nuevo: Para almacenamiento persistente (NVS)
-#include <WebServer.h>          // 🛠️ Nuevo: Para servir el portal web
-#include <DNSServer.h>          // 🛠️ Nuevo: Para redirigir el tráfico al portal
+#include <Preferences.h>        // 🛠️ Para almacenamiento persistente (NVS)
+#include <WebServer.h>          // 🛠️ Para servir el portal web
+#include <DNSServer.h>          // 🛠️ Para redirigir el tráfico al portal
 
 // ======================================================
 // 0. VERSIÓN LOCAL DEL FIRMWARE (DEFINE LA VERSIÓN ACTUAL)
 // ======================================================
-const char* FIRMWARE_VERSION_CODE = "1.0.2";
+const char* FIRMWARE_VERSION_CODE = "1.0.3";
 
 
 // ======================================================
@@ -115,9 +115,10 @@ int compareVersions(String current, String remote);
 bool check_for_update();
 void perform_update();
 
-// 🛠️ Funciones del Portal Cautivo
+// 🛠️ Funciones del Portal Cautivo y NVS
 void saveCredentials(const String& ssid, const String& password);
 bool loadCredentials();
+void clearCredentials(); // ⬅️ Función para forzar el portal borrando credenciales
 void startConfigPortal();
 void handleRoot();
 void handleSave();
@@ -141,6 +142,9 @@ void setup() {
   // 1. INICIAR NVS (Preferencias)
   preferences.begin(PREFS_NAMESPACE, false);
 
+  // 🔴 LÍNEA DE PRUEBA: DESCOMENTA ESTA LÍNEA TEMPORALMENTE PARA FORZAR EL PORTAL CAUTIVO
+  clearCredentials(); 
+
   // 2. INTENTAR CARGAR CREDENCIALES GUARDADAS
   bool credentialsLoaded = loadCredentials();
   
@@ -150,8 +154,7 @@ void setup() {
       saveCredentials(DEFAULT_SSID, DEFAULT_PASS); // Guarda las credenciales "tili"
       credentialsLoaded = loadCredentials(); // Vuelve a cargar para que las variables tengan los valores
   }
-  // ---------------------------------------------------------------------------------
-
+  
   // 3. INTENTAR CONECTAR CON LAS CREDENCIALES (Cargadas o por defecto)
   if (credentialsLoaded && conectar_wifi()) {
       // ÉXITO: Conectado a Wi-Fi
@@ -171,7 +174,7 @@ void setup() {
 }
 
 // ======================================================
-// FUNCIONES DEL PORTAL CAUTIVO Y NVS (NUEVAS)
+// FUNCIONES DEL PORTAL CAUTIVO Y NVS
 // ======================================================
 
 /**
@@ -195,9 +198,20 @@ bool loadCredentials() {
     Serial.printf(F("📝 Credenciales cargadas: SSID = %s\n"), loadedSsid.c_str());
     return true;
   }
-  // Serial.println(F("📝 No se encontraron credenciales guardadas.")); // Comentado, manejado en setup()
   return false;
 }
+
+/**
+ * @brief Borra las credenciales de Wi-Fi de la NVS (SSID y PASS).
+ * Esto obliga al ESP a iniciar el Portal Cautivo si la conexión por defecto falla 
+ * o si no hay credenciales por defecto configuradas.
+ */
+void clearCredentials() {
+    preferences.remove(PREF_SSID);
+    preferences.remove(PREF_PASS);
+    Serial.println(F("🗑️ CREDENCIALES BORRADAS DE NVS."));
+}
+
 
 /**
  * @brief Inicializa el Access Point y el Servidor Web para la configuración.
@@ -286,7 +300,7 @@ void handleRoot() {
     <input type="password" id="password" name="password" placeholder="Dejar vacío si no tiene clave">
     <input type="submit" value="Guardar y Conectar">
   </form>
-  <div class="footer">Version Firmware: 1.0.0</div>
+  <div class="footer">Version Firmware: )raw" + String(FIRMWARE_VERSION_CODE) + R"raw(</div>
 </div>
 </body>
 </html>
@@ -327,7 +341,7 @@ void handleSave() {
 
 
 // ======================================================
-// FUNCIONES DE CONEXIÓN WIFI (ACTUALIZADA)
+// FUNCIONES DE CONEXIÓN WIFI 
 // ======================================================
 
 bool conectar_wifi() {
@@ -642,7 +656,7 @@ void leer_sensores_agua() {
 // ----------------------------------------------------
 void loop() {
   
-  // Si el portal cautivo está activo, el código nunca llega aquí.
+  // Si el portal cautivo está activo, el código se queda en el bucle 'while(true)' de startConfigPortal().
   
   // 1. LECTURA DE SENSORES
   leer_sensores_agua();
