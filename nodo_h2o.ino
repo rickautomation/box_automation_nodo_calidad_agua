@@ -18,7 +18,7 @@
 // ======================================================
 // 0. VERSIÓN LOCAL DEL FIRMWARE (DEFINE LA VERSIÓN ACTUAL)
 // ======================================================
-const char* FIRMWARE_VERSION_CODE = "1.0.4";
+const char* FIRMWARE_VERSION_CODE = "1.0.5"; // Versión incrementada
 
 // ======================================================
 // 1. CONFIGURACIÓN DE RED, FIREBASE Y PORTAL CAUTIVO
@@ -141,23 +141,22 @@ void setup() {
   preferences.begin(PREFS_NAMESPACE, false);
 
   // 2. CONFIGURACIÓN DEL PIN DEL BOTÓN BOOT (GPIO 9)
-  // El botón BOOT generalmente ya tiene un PULLUP interno.
   pinMode(WIFI_RESET_PIN, INPUT_PULLUP);
-  delay(50); // Pequeña espera para estabilización
+  delay(100); // 💡 Tiempo de espera más largo para que la lectura del pin sea estable
+
   
-  // 3. LÓGICA DEL BOTÓN DE RESET: Presionar BOOT (GPIO 9 a LOW) durante el arranque
-  // La lógica es: si el botón se mantiene presionado, el pin estará en LOW.
+  // 3. LÓGICA DE RESET MEJORADA: Si BOOT (GPIO 9) está presionado al inicio, forzar AP
   if (digitalRead(WIFI_RESET_PIN) == LOW) {
-    Serial.println(F("🚨 BOTÓN BOOT DETECTADO (GPIO 9 LOW). BORRANDO CREDENCIALES Y FORZANDO PORTAL..."));
+    Serial.println(F("🚨 BOTÓN BOOT DETECTADO (GPIO 9 LOW) AL INICIO. BORRANDO CREDENCIALES..."));
     clearCredentials(); 
-    // Después de borrar, hay que esperar un poco para que el usuario suelte el botón
-    Serial.println(F("Presiona el botón RESET/EN para continuar con la configuración."));
-    // En este punto, el ESP32 queda esperando a que el usuario presione RESET/EN o se reinicie.
-    
-    // Una alternativa es reiniciar directamente aquí, pero es mejor que el usuario lo haga:
-    // while (digitalRead(WIFI_RESET_PIN) == LOW) { delay(100); } // Esperar a que se suelte el BOOT
-    // ESP.restart(); 
+    Serial.println(F("📡 Iniciando Portal Cautivo INMEDIATAMENTE..."));
+    // Al llamar a startConfigPortal(), el código se detendrá en el bucle del portal, 
+    // y no continuará con la lógica de conexión normal.
+    startConfigPortal(); 
+    // Si el portal termina (por un reinicio), el setup comenzará de nuevo.
   }
+  
+  // -- A partir de aquí solo se ejecuta si el botón BOOT NO fue presionado --
   
   // 4. INTENTAR CARGAR CREDENCIALES GUARDADAS
   bool credentialsLoaded = loadCredentials();
@@ -183,11 +182,9 @@ void setup() {
       // FALLO: La conexión con las credenciales (por defecto o guardadas) falló.
       Serial.println(F("❌ Fallo al conectar con credenciales."));
       
-      // Si el código llegó aquí después de un reseteo forzado, es cuando se activa el portal.
-      Serial.println(F("📡 Iniciando Portal Cautivo para configuración Wi-Fi..."));
       // 6. INICIAR PORTAL
+      Serial.println(F("📡 Iniciando Portal Cautivo para configuración Wi-Fi..."));
       startConfigPortal();
-      // El código se detiene aquí hasta que el usuario configura y el ESP se reinicia
   }
 }
 
@@ -313,8 +310,8 @@ void handleRoot() {
   <div class="logo">💧</div>
   <h1>Configura tu Nodo H2O</h1>
   <p>Conéctate a tu red Wi-Fi para que el nodo pueda enviar datos.</p>
-  <p style="font-size: 12px; color: #B00020;">
-    Para resetear la configuración, mantén presionado el botón BOOT al iniciar.
+  <p style="font-size: 12px; color: #B00020; font-weight: bold;">
+    MANTÉN PRESIONADO BOOT AL INICIAR para borrar credenciales y entrar aquí.
   </p>
   <form method="POST" action="/save">
     <label for="ssid">SSID (Nombre de la Red):</label>
