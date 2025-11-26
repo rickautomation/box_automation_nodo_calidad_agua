@@ -2,7 +2,7 @@
  * SKETCH: nodo_h2o.ino
  * OBJETIVO: Versión final con CONFIGURACIÓN WIFI VÍA PORTAL CAUTIVO, 
  * Configuración Dinámica desde Firebase y Actualización OTA.
- * * * * IMPLEMENTACIÓN DE PORTAL CAUTIVO:
+ * * * * * IMPLEMENTACIÓN DE PORTAL CAUTIVO:
  * 1. Uso de Preferences.h para guardar SSID y Password de forma persistente (NVS).
  * 2. Si no hay credenciales o falla la conexión, el ESP32 crea un Access Point (AP).
  * 3. Se sirve una página HTML para que el usuario ingrese la red y clave.
@@ -21,7 +21,7 @@
 // ======================================================
 // 0. VERSIÓN LOCAL DEL FIRMWARE (DEFINE LA VERSIÓN ACTUAL)
 // ======================================================
-const char* FIRMWARE_VERSION_CODE = "1.0.0";
+const char* FIRMWARE_VERSION_CODE = "1.0.2";
 
 
 // ======================================================
@@ -31,6 +31,12 @@ const char* FIRMWARE_VERSION_CODE = "1.0.0";
 // ⚠️ REEMPLAZAR CON TUS CLAVES Y HOST
 const char* API_KEY = "AIzaSyAxGSXV2br1SsFu7YyP6NZaTXc_Z40uqA8"; 
 const char* RTDB_HOST = "arduinoconfigremota-default-rtdb.firebaseio.com";                   
+
+// 🔑 CREDENCIALES POR DEFECTO PARA FORZAR CONEXIÓN INICIAL 🔑
+// Útil para la primera carga del firmware sin tener que usar el Portal Cautivo.
+const char* DEFAULT_SSID = "tili";         
+const char* DEFAULT_PASS = "Ubuntu1234$"; 
+
 
 // 🛠️ VARIABLES GLOBALES PARA EL PORTAL CAUTIVO Y NVS
 Preferences preferences;
@@ -135,9 +141,18 @@ void setup() {
   // 1. INICIAR NVS (Preferencias)
   preferences.begin(PREFS_NAMESPACE, false);
 
-  // 2. INTENTAR CARGAR Y CONECTAR CON CREDENCIALES GUARDADAS
+  // 2. INTENTAR CARGAR CREDENCIALES GUARDADAS
   bool credentialsLoaded = loadCredentials();
   
+  // 🔑 LÓGICA AGREGADA: Si no hay credenciales, fuerza las predeterminadas y las guarda
+  if (!credentialsLoaded) {
+      Serial.println(F("🟡 INFO: No hay credenciales guardadas. Forzando credenciales por defecto..."));
+      saveCredentials(DEFAULT_SSID, DEFAULT_PASS); // Guarda las credenciales "tili"
+      credentialsLoaded = loadCredentials(); // Vuelve a cargar para que las variables tengan los valores
+  }
+  // ---------------------------------------------------------------------------------
+
+  // 3. INTENTAR CONECTAR CON LAS CREDENCIALES (Cargadas o por defecto)
   if (credentialsLoaded && conectar_wifi()) {
       // ÉXITO: Conectado a Wi-Fi
       Serial.println(F("✅ Conexión Wi-Fi exitosa con credenciales guardadas."));
@@ -146,10 +161,10 @@ void setup() {
       check_for_update();
       lastConfigFetch = millis();
   } else {
-      // FALLO: No hay credenciales o la conexión falló
-      Serial.println(F("❌ Fallo al conectar con credenciales guardadas o no hay credenciales."));
+      // FALLO: La conexión con las credenciales (por defecto o guardadas) falló.
+      Serial.println(F("❌ Fallo al conectar con credenciales."));
       Serial.println(F("📡 Iniciando Portal Cautivo para configuración Wi-Fi..."));
-      // 3. INICIAR PORTAL
+      // 4. INICIAR PORTAL
       startConfigPortal();
       // El código se detiene aquí hasta que el usuario configura y el ESP se reinicia
   }
@@ -180,7 +195,7 @@ bool loadCredentials() {
     Serial.printf(F("📝 Credenciales cargadas: SSID = %s\n"), loadedSsid.c_str());
     return true;
   }
-  Serial.println(F("📝 No se encontraron credenciales guardadas."));
+  // Serial.println(F("📝 No se encontraron credenciales guardadas.")); // Comentado, manejado en setup()
   return false;
 }
 
@@ -227,7 +242,7 @@ void handleRoot() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Configuración NODO H2O</title>
+  <title>Configuracion NODO H2O</title>
   <style>
     body { font-family: Arial, sans-serif; text-align: center; margin: 0; padding: 20px; background-color: #f4f7f6; }
     .container { max-width: 400px; margin: auto; padding: 25px; background: #ffffff; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
