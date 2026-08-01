@@ -11,9 +11,12 @@
 #include <ArduinoJson.h>       
 #include <Update.h>            
 #include <WiFiClientSecure.h>  
-#include <Preferences.h>        // 🛠️ Para almacenamiento persistente (NVS)
-#include <WebServer.h>          // 🛠️ Para servir el portal web
-#include <DNSServer.h>          // 🛠️ Para redirigir el tráfico al portal
+#include <Preferences.h>        
+#include <WebServer.h>          
+#include <DNSServer.h>          
+#include <ArduinoOTA.h>
+#include <esp_task_wdt.h>
+
 
 // ======================================================
 // 0. VERSIÓN LOCAL DEL FIRMWARE (DEFINE LA VERSIÓN ACTUAL)
@@ -120,6 +123,8 @@ void clearCredentials();
 void startConfigPortal();
 void handleRoot();
 void handleSave();
+void logMessage(String level, String msg);
+
 
 
 // ======================================================
@@ -137,12 +142,22 @@ void setup() {
   Serial.println(F("\n--- 💧 Nodo de Monitoreo de Agua ---"));
   Serial.printf(F("VERSIÓN ACTUAL (Local): %s\n"), latestFirmwareVersion.c_str());
   
-  // 1. INICIAR NVS (Preferencias)
-  preferences.begin(PREFS_NAMESPACE, false);
+  // Iniciar Hardware Watchdog (30 segundos) - API v3.x (ESP-IDF v5)
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = 30000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_err_t err = esp_task_wdt_init(&wdt_config);
+  if (err == ESP_ERR_INVALID_STATE) {
+    esp_task_wdt_reconfigure(&wdt_config);
+  }
+  esp_task_wdt_add(NULL);
 
-  // 2. CONFIGURACIÓN DEL PIN DEL BOTÓN BOOT (GPIO 9)
+  preferences.begin(PREFS_NAMESPACE, false);
   pinMode(WIFI_RESET_PIN, INPUT_PULLUP);
-  delay(100); // 💡 Tiempo de espera más largo para que la lectura del pin sea estable
+  delay(100); 
+
 
   
   // 3. LÓGICA DE RESET MEJORADA: Si BOOT (GPIO 9) está presionado al inicio, forzar AP
@@ -170,23 +185,18 @@ void setup() {
       credentialsLoaded = true; 
   }
   
-  // 5. INTENTAR CONECTAR CON LAS CREDENCIALES (Cargadas o por defecto)
   if (credentialsLoaded && conectar_wifi()) {
-      // ÉXITO: Conectado a Wi-Fi
-      Serial.println(F("✅ Conexión Wi-Fi exitosa con credenciales guardadas."));
-      // Continuar con la lógica remota
+      ArduinoOTA.begin();
+      logMessage("INFO", "✅ Conexión Wi-Fi exitosa con credenciales guardadas.");
       obtener_remote_config();
       check_for_update();
       lastConfigFetch = millis();
   } else {
-      // FALLO: La conexión con las credenciales (por defecto o guardadas) falló.
-      Serial.println(F("❌ Fallo al conectar con credenciales."));
-      
-      // 6. INICIAR PORTAL
-      Serial.println(F("📡 Iniciando Portal Cautivo para configuración Wi-Fi..."));
+      logMessage("ERROR", "❌ Fallo al conectar con credenciales.");
       startConfigPortal();
   }
 }
+
 
 // ======================================================
 // FUNCIONES DEL PORTAL CAUTIVO Y NVS
@@ -257,11 +267,13 @@ void startConfigPortal() {
 
   // Bucle infinito del portal (se sale con ESP.restart() en handleSave)
   while (true) {
+    esp_task_wdt_reset();
     dnsServer.processNextRequest();
     server.handleClient();
     delay(1);
   }
 }
+
 
 /**
  * @brief Sirve la página HTML del formulario.
@@ -364,8 +376,15 @@ void handleSave() {
 // FUNCIONES DE CONEXIÓN WIFI 
 // ======================================================
 
+
+void resetWifiStack() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(1000);
+}
 bool conectar_wifi() {
   Serial.print(F("\n📡 Encendiendo Wi-Fi y conectando..."));
+  resetWifiStack();
   WiFi.mode(WIFI_STA);
   
   // Usar las credenciales cargadas/guardadas
@@ -373,6 +392,7 @@ bool conectar_wifi() {
 
   unsigned long inicio = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - inicio < TIEMPO_MAX_CONEXION_WIFI)) {
+    esp_task_wdt_reset();
     delay(500);
     Serial.print(F("."));
   }
@@ -496,6 +516,7 @@ bool obtener_remote_config() {
 
   HTTPClient http;
   http.begin(fullUrl); 
+  http.setTimeout(3000);
   
   int httpCode = http.GET();
   
@@ -616,6 +637,7 @@ void enviar_post_batch() {
     http.setConnectTimeout(15000); 
     
     http.begin(url);
+    http.setTimeout(3000);
     http.addHeader("Content-Type", "application/json");
     
     int httpResponseCode = http.POST(jsonBuffer);
@@ -647,72 +669,84 @@ void calcular_calibracion_ph() {
 
 void leer_sensores_agua() {
   
-  // 1. LECTURA pH (GPIO 5)
-  delay(10); 
-  ph_raw = analogRead(PH_PIN);
+  // Oversampling de pH (10 lecturas)
+  long sum_ph = 0;
+  for (int i=0; i<10; i++) {
+    sum_ph += analogRead(PH_PIN);
+    delay(2);
+  }
+  ph_raw = sum_ph / 10;
   ph_voltage = (float)ph_raw * (ADC_VOLTAGE_REF / ADC_MAX_VALUE);
   ph_value = ph_slope * ph_voltage + ph_offset;
 
   if (ph_raw <= 5 || ph_raw >= ADC_MAX_VALUE - 5) {
-      Serial.println(F("⚠️ ALERTA PH: Lectura en extremos. Revisa conexión."));
+      logMessage("WARNING", "⚠️ ALERTA PH: Lectura en extremos. Revisa conexión.");
   }
   
-  // 2. LECTURA TDS (GPIO 4)
-  delay(10); 
-  tds_raw = analogRead(TDS_PIN);
+  // Oversampling de TDS (10 lecturas)
+  long sum_tds = 0;
+  for (int i=0; i<10; i++) {
+    sum_tds += analogRead(TDS_PIN);
+    delay(2);
+  }
+  tds_raw = sum_tds / 10;
   tds_voltage = (float)tds_raw * (ADC_VOLTAGE_REF / ADC_MAX_VALUE);
   tds_value = 0.0; 
   
   if (tds_raw == 0) {
-      Serial.printf(F("❌ ERROR TDS: Lectura RAW es CERO (0) en GPIO %d.\n"), TDS_PIN);
+      logMessage("ERROR", "❌ ERROR TDS: Lectura RAW es CERO (0).");
   }
+
   
   Serial.printf(F("   PH: %.2f pH / TDS: %.3f V\n"), ph_value, tds_voltage);
 }
 
 
-// ----------------------------------------------------
-// BUCLE PRINCIPAL (LÓGICA DE TIEMPO Y CONFIGURACIÓN)
-// ----------------------------------------------------
 void loop() {
-  
-  // Si el portal cautivo está activo, el código se queda en el bucle 'while(true)' de startConfigPortal().
-  
-  // 1. LECTURA DE SENSORES
-  leer_sensores_agua();
+  esp_task_wdt_reset();
+  ArduinoOTA.handle();
 
-  bool connected = false;
+  unsigned long tiempoActual = millis();
+  static unsigned long lastRun = 0;
   
-  // 2. CONEXIÓN 
-  if (conectar_wifi()) {
-    connected = true;
-  }
-  
-  if (connected) {
-      
-      // 3. VERIFICAR SI ES TIEMPO DE CONFIGURACIÓN
-      if (millis() - lastConfigFetch >= CONFIG_FETCH_INTERVAL) {
+  if (tiempoActual - lastConfigFetch >= CONFIG_FETCH_INTERVAL) {
+      if (conectar_wifi()) {
           obtener_remote_config(); 
           check_for_update();
-          lastConfigFetch = millis();
       }
-      
-      // 4. ENVÍO DE DATOS
-      enviar_post_batch();
-      
-      // 5. DESCONEXIÓN 
-      Serial.println(F("\n🔌 Desconectando Wi-Fi para ahorrar energía..."));
-      WiFi.disconnect(true); 
-      WiFi.mode(WIFI_OFF);
-      
-  } else {
-    // Si falla la conexión en LOOP, reinicia para intentar el portal cautivo si es necesario.
-    Serial.println(F("❌ Fallo la reconexión en LOOP. Reiniciando para forzar reintento/portal."));
-    delay(5000);
-    ESP.restart();
+      lastConfigFetch = tiempoActual;
   }
-  
-  // 6. ESPERA
-  Serial.printf(F("💤 Entrando en espera por %ld ms.\n"), intervaloEnvioMs);
-  delay(intervaloEnvioMs); 
+
+  if (tiempoActual - lastRun >= intervaloEnvioMs) {
+    lastRun = tiempoActual;
+
+    leer_sensores_agua();
+
+    if (conectar_wifi()) {
+        enviar_post_batch();
+    } else {
+        logMessage("ERROR", "❌ Fallo la conexión WiFi al enviar.");
+    }
+  }
+}
+
+void logMessage(String level, String msg) {
+  Serial.println("[" + level + "] " + msg);
+  if (WiFi.status() == WL_CONNECTED && backendHost != "") {
+    HTTPClient http;
+    String url = "http://" + backendHost + ":" + String(backendPort) + "/sensor-data/logs";
+    http.begin(url);
+    http.setTimeout(3000);
+    http.addHeader("Content-Type", "application/json");
+    
+    DynamicJsonDocument doc(512);
+    doc["boxSerialId"] = boxSerialId;
+    doc["level"] = level;
+    doc["message"] = msg;
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    http.POST(jsonStr);
+    http.end();
+  }
 }
